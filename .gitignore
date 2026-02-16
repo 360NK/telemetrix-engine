@@ -1,0 +1,36 @@
+# Prerequisites
+*.d
+
+# Object files
+*.o
+*.obj
+
+# Binary Executables (The result of your compile)
+telemetrix
+ghost_bus
+
+# Libraries
+*.lib
+*.a
+
+# Shared objects (dynamic libraries)
+*.so
+*.dylib
+*.dll
+
+# Protobuf Generated Files (We regenerate these on build)
+*.pb-c.c
+*.pb-c.h
+
+# Logs and Data (Never commit real data)
+*.bin
+*.log
+*.sqlite
+logs/*
+
+# OS Junk
+.DS_Store
+.vscode/
+**/.DS_Store
+**/._*
+._*

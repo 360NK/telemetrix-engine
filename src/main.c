@@ -3,7 +3,7 @@
 #include <string.h>
 #include <curl/curl.h>
 
-#include "proto/gtfs-realtime.pb-c.h"
+#include "../proto/gtfs-realtime.pb-c.h"
 
 struct MemoryStruct {
     char *memory;

@@ -1,5 +1,5 @@
 CFLAGS = -Wall -Wextra -std=c11 -Iinclude -I.
-LDFLAGS = -lcurl -lprotobuf-c
+LDFLAGS = -lcurl -lprotobuf-c -lsqlite3
 
 # Directories
 SRC_DIR = src

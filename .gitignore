@@ -27,6 +27,8 @@ ghost_bus
 *.log
 *.sqlite
 logs/*
+*.db
+transit.db
 
 # OS Junk
 .DS_Store

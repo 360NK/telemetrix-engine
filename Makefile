@@ -1,4 +1,4 @@
-CFLAGS = -Wall -Wextra -std=c11 -Iinclude -I.
+CFLAGS = -Wall -Wextra -std=c11 -fsanitize=address -g -Iinclude -I.
 LDFLAGS = -lcurl -lprotobuf-c -lsqlite3
 
 # Directories

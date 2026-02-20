@@ -7,7 +7,20 @@
 #include <unistd.h>
 #include <signal.h>
 
+#include <pthread.h>
+#include "../include/buffer.h"
+
 #include "../proto/gtfs-realtime.pb-c.h"
+
+sqlite3 *db = NULL;
+RingBuffer *engine_buffer = NULL;
+
+void handle_sigint(int sig) {
+    printf("\nCaught signal %d. Shutting down safely...\n", sig);
+    if (engine_buffer != NULL) {
+        buffer_signal_shutdown(engine_buffer);
+    }
+}
 
 struct MemoryStruct {
     char *memory;
@@ -77,15 +90,130 @@ void save_vehicle(sqlite3 *db, const char *fleet, const char *internal, const ch
     sqlite3_finalize(res);
 }
 
-static volatile int keep_running = 1;
+void *fetcher_thread(void *arg) {
+    RingBuffer *rb = (RingBuffer *)arg;
+    const char* url = "https://opendata.hamilton.ca/GTFS-RT/GTFS_VehiclePositions.pb";
+    
+    printf("[Fetcher] thread started. Ready to hit the network. \n");
 
-void handle_sigint(int sig) {
-    printf("\nCaught signal %d. Shutting down safely...\n", sig);
-    keep_running = 0;
+    while (!rb->shutdown) {
+        struct MemoryStruct chunk;
+        chunk.memory = malloc(1);
+        chunk.size = 0;
+
+        CURL *curl_handle = curl_easy_init();
+        if (!curl_handle) {
+            free(chunk.memory);
+            sleep(10);
+            continue;
+        }
+
+        curl_easy_setopt(curl_handle, CURLOPT_URL, url);
+        curl_easy_setopt(curl_handle, CURLOPT_WRITEFUNCTION, WriteMemoryCallback);
+        curl_easy_setopt(curl_handle, CURLOPT_WRITEDATA, (void *)&chunk);
+        curl_easy_setopt(curl_handle, CURLOPT_FOLLOWLOCATION, 1L);
+        curl_easy_setopt(curl_handle, CURLOPT_USERAGENT, "libcurl-agent/1.0");
+
+        CURLcode res = curl_easy_perform(curl_handle);
+        curl_easy_cleanup(curl_handle);
+
+        if(res != CURLE_OK) {
+            fprintf(stderr, "[Fetcher] Download Failed: %s\n", curl_easy_strerror(res));
+            free(chunk.memory);
+            sleep(10);
+            continue;
+        }
+
+        TransitRealtime__FeedMessage *msg;
+        msg = transit_realtime__feed_message__unpack(NULL, chunk.size, (const uint8_t *)chunk.memory);
+
+        if (msg == NULL) {
+            fprintf(stderr, "[Fetcher] Error unpacking incoming message\n");
+            free(chunk.memory);
+            sleep(10);
+            continue;
+        }
+
+        int pushed_count = 0;
+        for (size_t i = 0; i < msg->n_entity; i++) {
+            TransitRealtime__FeedEntity *entity = msg->entity[i];
+
+            if (entity->vehicle && entity->vehicle->position) {
+                VehicleData item;
+
+                const char *raw_fleet = (entity->vehicle->vehicle && entity->vehicle->vehicle->label) ? entity->vehicle->vehicle->label : (entity->id ? entity->id : "UNKNOWN");
+                strncpy(item.fleet_number, raw_fleet, sizeof(item.fleet_number) - 1);
+                item.fleet_number[sizeof(item.fleet_number) - 1] = '\0';
+
+                const char *raw_internal_id = (entity->vehicle->vehicle && entity->vehicle->vehicle->id) ? entity->vehicle->vehicle->id : "UNKNOWN";
+                strncpy(item.internal_id, raw_internal_id, sizeof(item.internal_id) - 1);
+                item.internal_id[sizeof(item.internal_id) - 1] = '\0';
+
+                const char *raw_route = (entity->vehicle->trip && entity->vehicle->trip->route_id) ? entity->vehicle->trip->route_id : "UNKNOWN";
+                strncpy(item.route_id, raw_route, sizeof(item.route_id) - 1);
+                item.route_id[sizeof(item.route_id) - 1] = '\0';
+
+                item.lat = entity->vehicle->position->latitude;
+                item.lon = entity->vehicle->position->longitude;
+
+                if (buffer_push(rb, item)) {
+                    pushed_count++;
+                } else {
+                    break; 
+                }
+            }
+        }
+        printf("[Fetcher] Successfully pushed %d vehicles to the Ring Buffer.\n", pushed_count);
+
+        transit_realtime__feed_message__free_unpacked(msg, NULL);
+        free(chunk.memory);
+
+        for(int i = 0; i < 10 && !rb->shutdown; i++) {
+            sleep(1);
+        }
+    }
+
+    printf("[Fetcher] Shutting down cleanly.\n");
+    return NULL;
+}
+
+void *logger_thread(void *arg) {
+    RingBuffer *rb = (RingBuffer *)arg;
+    VehicleData item;
+
+    printf("[Logger] Thread started. Ready to write to SQLite.\n");
+
+    int transaction_count = 0;
+    sqlite3_exec(db, "BEGIN TRANSACTION;", NULL, NULL, NULL);
+
+    while (!rb->shutdown) {
+        if (buffer_pop(rb, &item)) {
+            save_vehicle(db, item.fleet_number, item.internal_id, item.route_id, item.lat, item.lon);
+            transaction_count++;
+
+            if (transaction_count >= 100) {
+                sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
+                printf("[Logger] Committed %d vehicles to disk.\n", transaction_count);
+                transaction_count = 0;
+                
+                if (!rb->shutdown) {
+                    sqlite3_exec(db, "BEGIN TRANSACTION;", NULL, NULL, NULL);
+                }
+            }
+        }
+    }
+
+    if (transaction_count > 0) {
+        sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
+        printf("[Logger] Committed final %d vehicles before shutting down.\n", transaction_count);
+    }
+
+    printf("[Logger] Shutting down cleanly.\n");
+    return NULL;
 }
 
 int main(void) {
-    sqlite3 *db;
+
     if (sqlite3_open("transit.db", &db)) {
         fprintf(stderr, "Can't open database: %s\n", sqlite3_errmsg(db));
         return 1;
@@ -97,82 +225,30 @@ int main(void) {
     }
     
     curl_global_init(CURL_GLOBAL_ALL);
+    
+    engine_buffer = buffer_init(1000);
+    if (!engine_buffer) {
+        fprintf(stderr, "Fatal: Could not alocate Ring Buffer. \n");
+        return 1;
+    }
+
     signal(SIGINT, handle_sigint);
 
-    const char* url = "https://opendata.hamilton.ca/GTFS-RT/GTFS_VehiclePositions.pb";
     printf("Telemetrix Engine Started. Press Ctrl+C to stop.\n");
 
-    while (keep_running) {
-        struct MemoryStruct chunk;
-        chunk.memory = malloc(1);
-        chunk.size = 0;
+    pthread_t fetcher_id, logger_id;
 
-        CURL *curl_handle = curl_easy_init();
-        CURLcode res;
+    printf("Telemetrix Engine Started. Spawning threads...\n");
 
-        if (curl_handle) {
-            curl_easy_setopt(curl_handle, CURLOPT_URL, url);
-            curl_easy_setopt(curl_handle, CURLOPT_WRITEFUNCTION, WriteMemoryCallback);
-            curl_easy_setopt(curl_handle, CURLOPT_WRITEDATA, (void *)&chunk);
-            curl_easy_setopt(curl_handle, CURLOPT_FOLLOWLOCATION, 1L);
-            curl_easy_setopt(curl_handle, CURLOPT_USERAGENT, "libcurl-agent/1.0");
-    
-            printf("Connecting to %s ...\n", url);
-            res = curl_easy_perform(curl_handle);
-    
-            curl_easy_cleanup(curl_handle);
-    
-            if(res != CURLE_OK) {
-                fprintf(stderr, "Download Failed: %s\n", curl_easy_strerror(res));
-                free(chunk.memory);
-                sleep(10);
-                continue;
-            }
-            printf("SUCCESS: Downloaded %lu bytes of binary data.\n", (unsigned long)chunk.size);
-            
-            TransitRealtime__FeedMessage *msg;
-            msg = transit_realtime__feed_message__unpack(NULL, chunk.size, (const uint8_t *)chunk.memory);
-    
-            if (msg == NULL) {
-                fprintf(stderr, "Error unpacking incoming message\n");
-                free(chunk.memory);
-                sleep(10);
-                continue;
-            }
-    
-            sqlite3_exec(db, "BEGIN TRANSACTION;", NULL, NULL, NULL);
-    
-            int saved_count = 0;
-            for (size_t i = 0; i < msg->n_entity; i++) {
-                TransitRealtime__FeedEntity *entity = msg->entity[i];
-                if (entity->vehicle) {
-                    char *fleet = (entity->vehicle->vehicle && entity->vehicle->vehicle->label) ? 
-                                   entity->vehicle->vehicle->label : (entity->id ? entity->id : "UNKOWN");
-                    
-                    char *internal = (entity->vehicle->vehicle && entity->vehicle->vehicle->id) ? 
-                                      entity->vehicle->vehicle->id : "UNKOWN";
-                    
-                    char *route = (entity->vehicle->trip && entity->vehicle->trip->route_id) ? 
-                                   entity->vehicle->trip->route_id : "UNKOWN";
-    
-                    float lat = (entity->vehicle->position) ? entity->vehicle->position->latitude : 0.0;
-                    float lon = (entity->vehicle->position) ? entity->vehicle->position->longitude : 0.0;
-    
-                    save_vehicle(db, fleet, internal, route, lat, lon);
-                    saved_count++;
-                }
-            }
-    
-            sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
-            printf("DONE: Saved %d vehicle records to database.\n", saved_count);
-    
-            transit_realtime__feed_message__free_unpacked(msg, NULL);
-            free(chunk.memory);
-        }
-        printf("Sleeping for 10s...\n");
-        sleep(10);
-    }
-    printf("Exiting...\n");
+    pthread_create(&fetcher_id, NULL, fetcher_thread, engine_buffer);
+    pthread_create(&logger_id, NULL, logger_thread, engine_buffer);
+
+    printf("Threads running. Press Ctrl+C to stop.\n");
+
+    pthread_join(fetcher_id, NULL);
+    pthread_join(logger_id, NULL);
+
+    buffer_destroy(engine_buffer);
     sqlite3_close(db);
     curl_global_cleanup();
     

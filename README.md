@@ -1,7 +1,5 @@
 # Telemetrix Engine (TransitMind)
 
-# Telemetrix Engine (TransitMind)
-
 A high-performance telemetry ingestion engine for the Hamilton Street Railway (HSR), written in C.
 
 ## Overview

@@ -12,6 +12,8 @@
 
 #include "../proto/gtfs-realtime.pb-c.h"
 
+#include <time.h> //For testing and metrics
+
 sqlite3 *db = NULL;
 RingBuffer *engine_buffer = NULL;
 
@@ -92,7 +94,8 @@ void save_vehicle(sqlite3 *db, const char *fleet, const char *internal, const ch
 
 void *fetcher_thread(void *arg) {
     RingBuffer *rb = (RingBuffer *)arg;
-    const char* url = "https://opendata.hamilton.ca/GTFS-RT/GTFS_VehiclePositions.pb";
+    // const char* url = "https://opendata.hamilton.ca/GTFS-RT/GTFS_VehiclePositions.pb";
+    const char* url = "https://gtfsrt.ttc.ca/vehicles/position?format=binary";
     
     printf("[Fetcher] thread started. Ready to hit the network. \n");
 
@@ -124,6 +127,9 @@ void *fetcher_thread(void *arg) {
             continue;
         }
 
+        struct timespec start, end;
+        clock_gettime(CLOCK_MONOTONIC, &start);
+
         TransitRealtime__FeedMessage *msg;
         msg = transit_realtime__feed_message__unpack(NULL, chunk.size, (const uint8_t *)chunk.memory);
 
@@ -133,6 +139,11 @@ void *fetcher_thread(void *arg) {
             sleep(10);
             continue;
         }
+
+        clock_gettime(CLOCK_MONOTONIC, &end);
+        double time_taken = (end.tv_sec - start.tv_sec) * 1e9;
+        time_taken = (time_taken + (end.tv_nsec - start.tv_nsec)) * 1e-6; 
+        printf("Protobuf Decoding took: %f milliseconds\n", time_taken);
 
         int pushed_count = 0;
         for (size_t i = 0; i < msg->n_entity; i++) {
